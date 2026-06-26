@@ -21,6 +21,7 @@ import Chart, {ActiveElement, ChartEvent, TooltipItem} from 'chart.js/auto';
 import {Args, ArgsDict} from '../../../components/sql_utils/args';
 import {Button} from '../../../widgets/button';
 import {Icons} from '../../../base/semantic_icons';
+import {HTMLAttrs} from '../../../widgets/common';
 
 interface Component {
   name: string;
@@ -67,6 +68,84 @@ function flattenTopLevelArgs(args: ArgsDict): Array<[string, Args]> {
     }
   }
   return flattened;
+}
+
+interface MemoryPssTotalPanelAttrs {
+  data?: ArgsDict;
+}
+
+interface SectionWithRightContentAttrs extends HTMLAttrs {
+  title: string;
+  rightContent?: m.Children;
+}
+
+interface AliveMemorySummary {
+  componentCounts: Record<string, number>;
+  elementCount: number;
+  mainThreadScriptingEngines: Array<{
+    instanceId: number;
+    desc: string;
+    sizeBytes: number;
+    rssSizeBytes: number;
+  }>;
+  backgroundThreadScriptingEngines: Record<string, {
+    btsEngineName: string;
+    desc: string;
+    sizeBytes: number;
+    rssSizeBytes: number;
+    instanceIds: number[];
+    instances: Array<{
+      instanceId: number;
+      url: string;
+    }>;
+  }>;
+  totalEngineSizeBytes: number;
+  totalEngineRssSizeBytes: number;
+  btsVmPoolSizeBytes: number;
+  btsVmPoolRssSizeBytes: number;
+  mtsVmPoolSizeBytes: number;
+  mtsVmPoolRssSizeBytes: number;
+  totalVmPoolSizeBytes: number;
+  totalVmPoolRssSizeBytes: number;
+}
+
+interface PssMemoryDeltas {
+  physicalMemorySizeBytes: number;
+  totalEngineSizeBytes: number;
+  totalEngineRssSizeBytes: number;
+  totalBtsEngineSizeBytes: number;
+  totalBtsEngineRssSizeBytes: number;
+  totalMtsEngineSizeBytes: number;
+  totalMtsEngineRssSizeBytes: number;
+  btsEngineSizeBytes: Record<string, number>;
+  btsEngineRssSizeBytes: Record<string, number>;
+}
+
+type MemoryPssTotalMode = 'acc' | 'rss';
+
+let memoryPssTotalMode: MemoryPssTotalMode = 'acc';
+
+class SectionWithRightContent implements
+  m.ClassComponent<SectionWithRightContentAttrs> {
+  view({attrs, children}: m.CVnode<SectionWithRightContentAttrs>) {
+    const {title, rightContent, ...htmlAttrs} = attrs;
+    return m(
+      'section.pf-section',
+      htmlAttrs,
+      m('header', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+        },
+      }, [
+        m('h1', title),
+        rightContent,
+      ]),
+      m('article', children),
+    );
+  }
 }
 
 class MemoryDashboard implements m.ClassComponent<MemoryDashboardAttrs> {
@@ -791,4 +870,520 @@ class MemoryDashboard implements m.ClassComponent<MemoryDashboardAttrs> {
   }
 }
 
-export default MemoryDashboard;
+class MemoryPssTotalModeSelector implements m.ClassComponent {
+  private showMemoryModeTooltip = false;
+
+  view(): m.Children {
+    return m('div', {
+      style: {
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'flex-end',
+        gap: '6px',
+        fontSize: '12px',
+      },
+    }, [
+      m('span', {style: {fontWeight: 'bold'}}, 'Memory Mode'),
+      m('span', {
+        style: {
+          position: 'relative',
+          display: 'inline-flex',
+        },
+        onmouseover: () => {
+          this.showMemoryModeTooltip = true;
+          m.redraw();
+        },
+        onmouseout: () => {
+          this.showMemoryModeTooltip = false;
+          m.redraw();
+        },
+      }, [
+        m('span', {
+          style: {
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '14px',
+            height: '14px',
+            borderRadius: '50%',
+            border: '1px solid rgba(0, 0, 0, 0.35)',
+            fontSize: '10px',
+            cursor: 'help',
+            opacity: '0.8',
+          },
+        }, '?'),
+        this.showMemoryModeTooltip ? m('div', {
+          style: {
+            position: 'absolute',
+            top: '20px',
+            right: '0',
+            zIndex: '10',
+            width: '360px',
+            padding: '8px 10px',
+            borderRadius: '4px',
+            backgroundColor: 'rgba(32, 32, 32, 0.95)',
+            color: '#fff',
+            fontSize: '12px',
+            lineHeight: '1.4',
+            boxShadow: '0 2px 8px rgba(0, 0, 0, 0.25)',
+          },
+        }, [
+          m('div', {
+            style: {
+              fontWeight: 'bold',
+              fontSize: '13px',
+            },
+          }, 'Accumulate'),
+          m('div', {
+            style: {
+              marginBottom: '16px',
+            },
+          }, 'Accumulated memory usage of all surviving JavaScript objects.'),
+          m('div', {
+            style: {
+              fontWeight: 'bold',
+              fontSize: '13px',
+            },
+          }, 'Resident Set'),
+          m('div', 'Engine-related memory page usage resident in physical memory.'),
+        ]) : null,
+      ]),
+      m('select', {
+        value: memoryPssTotalMode,
+        onchange: (e: Event) => {
+          memoryPssTotalMode =
+            (e.currentTarget as HTMLSelectElement).value as MemoryPssTotalMode;
+          m.redraw();
+        },
+        style: {
+          fontSize: '12px',
+          padding: '2px 6px',
+        },
+      }, [
+        m('option', {value: 'acc'}, 'Accumulate'),
+        m('option', {value: 'rss'}, 'Resident Set'),
+      ]),
+    ]);
+  }
+}
+
+class MemoryPssTotalPanel implements m.ClassComponent<MemoryPssTotalPanelAttrs> {
+  private collapsedBtsEngines: Set<string> = new Set();
+
+  private getAliveMemorySummary(data?: ArgsDict): AliveMemorySummary | undefined {
+    const summaryValue = this.getDebugArgValue(data, 'alive_memory_summary');
+    if (summaryValue === undefined) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(summaryValue) as AliveMemorySummary;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private getPssMemoryDeltas(data?: ArgsDict): PssMemoryDeltas | undefined {
+    const deltasValue = this.getDebugArgValue(data, 'pss_memory_deltas');
+    if (deltasValue === undefined) {
+      return undefined;
+    }
+
+    try {
+      return JSON.parse(deltasValue) as PssMemoryDeltas;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private getDebugArgValue(data: ArgsDict | undefined, key: string): string | undefined {
+    const debugArgs = data?.debug;
+    if (
+      debugArgs === null ||
+      debugArgs === undefined ||
+      typeof debugArgs !== 'object' ||
+      Array.isArray(debugArgs)
+    ) {
+      return undefined;
+    }
+
+    const value = debugArgs[key];
+    return value === undefined ? undefined : argToDisplayValue(value);
+  }
+
+  private formatBytes(bytes: number, decimals: number = 2): string {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+  }
+
+  private formatDeltaBytes(bytes: number): string {
+    const sign = bytes > 0 ? '+' : bytes < 0 ? '-' : '';
+    const absBytes = Math.abs(bytes);
+    return `${sign}${this.formatBytes(absBytes)}`;
+  }
+
+  private renderSinceTraceStartHint(): m.Children {
+    return m('span', {
+      style: {
+        marginLeft: '4px',
+        fontSize: '10px',
+        opacity: '0.7',
+      },
+    }, '(Since Trace Start)');
+  }
+
+  private getModeSize(accSizeBytes: number, rssSizeBytes?: number): number {
+    return memoryPssTotalMode === 'rss' ? rssSizeBytes ?? 0 : accSizeBytes;
+  }
+
+  private renderSizeWithSuffix(sizeBytes: number, suffix: string): m.Children {
+    return [
+      this.formatBytes(sizeBytes),
+      ' ',
+      m('span', {
+        style: {
+          fontSize: '10px',
+          opacity: '0.7',
+        },
+      }, suffix),
+    ];
+  }
+
+  private renderActiveAndPoolSize(
+    activeSizeBytes: number,
+    poolSizeBytes: number,
+  ): m.Children {
+    return [
+      this.renderSizeWithSuffix(activeSizeBytes, '(active)'),
+      poolSizeBytes > 0 ? [
+        ' ',
+        this.renderSizeWithSuffix(poolSizeBytes, '(in pool)'),
+      ] : null,
+    ];
+  }
+
+  private renderHoverTable(
+    columns: Array<{title: string; width: string}>,
+    rows: m.Children[][],
+  ): m.Children {
+    const tableStyle = {
+      width: '100%',
+      tableLayout: 'fixed',
+      borderCollapse: 'collapse',
+      marginBottom: '16px',
+    };
+    const cellStyle = {
+      padding: '4px 8px',
+      fontSize: '12px',
+      textAlign: 'left',
+      verticalAlign: 'top',
+    };
+    const headerCellStyle = {
+      ...cellStyle,
+      fontWeight: 'bold',
+    };
+
+    return m('table', {style: tableStyle}, [
+      m('thead', [
+        m('tr', columns.map((column) =>
+          m('th', {
+            style: {
+              ...headerCellStyle,
+              width: column.width,
+            },
+          }, column.title),
+        )),
+      ]),
+      m('tbody',
+        rows.map((row) =>
+          m('tr', {
+            onmouseover: (e: Event) => {
+              (e.currentTarget as HTMLElement).style.backgroundColor =
+                'rgba(0, 0, 0, 0.05)';
+            },
+            onmouseout: (e: Event) => {
+              (e.currentTarget as HTMLElement).style.backgroundColor =
+                'transparent';
+            },
+          }, row.map((cell) => m('td', {style: cellStyle}, cell))),
+        ),
+      ),
+    ]);
+  }
+
+  private renderBackgroundThreadScriptingEngines(
+    btsEngines: Array<AliveMemorySummary['backgroundThreadScriptingEngines'][string]>,
+    deltas?: PssMemoryDeltas,
+  ): m.Children {
+    return btsEngines.map((engineInfo) => {
+      const isExpanded = !this.collapsedBtsEngines.has(engineInfo.btsEngineName);
+      const btsEngineDelta =
+        memoryPssTotalMode === 'rss' ?
+          deltas?.btsEngineRssSizeBytes[engineInfo.btsEngineName] ?? 0 :
+          deltas?.btsEngineSizeBytes[engineInfo.btsEngineName] ?? 0;
+
+      return m('.bts-engine-section', {
+        style: {
+          marginBottom: '12px',
+          border: '1px solid rgba(0, 0, 0, 0.08)',
+          borderRadius: '4px',
+          overflow: 'hidden',
+        },
+      }, [
+        m('.bts-engine-header', {
+          onclick: () => {
+            if (isExpanded) {
+              this.collapsedBtsEngines.add(engineInfo.btsEngineName);
+            } else {
+              this.collapsedBtsEngines.delete(engineInfo.btsEngineName);
+            }
+          },
+          onmouseover: (e: Event) => {
+            (e.currentTarget as HTMLElement).style.backgroundColor =
+              'rgba(0, 0, 0, 0.05)';
+          },
+          onmouseout: (e: Event) => {
+            (e.currentTarget as HTMLElement).style.backgroundColor =
+              'rgba(0, 0, 0, 0.02)';
+          },
+          style: {
+            display: 'grid',
+            gridTemplateColumns: '22% 33% 25% 20%',
+            gap: '8px',
+            padding: '8px',
+            fontSize: '13px',
+            cursor: 'pointer',
+            backgroundColor: 'rgba(0, 0, 0, 0.02)',
+          },
+        }, [
+          m('span', engineInfo.btsEngineName),
+          m('span', engineInfo.desc),
+          m('span', this.formatBytes(this.getModeSize(
+            engineInfo.sizeBytes,
+            engineInfo.rssSizeBytes,
+          ))),
+          m('span', [
+            this.formatDeltaBytes(btsEngineDelta),
+            this.renderSinceTraceStartHint(),
+          ]),
+        ]),
+        isExpanded ? this.renderHoverTable(
+          [
+            {title: 'Instance ID', width: '15%'},
+            {title: 'URL', width: '85%'},
+          ],
+          engineInfo.instances.map((instance) => [
+            instance.instanceId,
+            instance.url,
+          ]),
+        ) : null,
+      ]);
+    });
+  }
+
+  private renderMemoryDeltas(deltas?: PssMemoryDeltas): m.Children {
+    if (deltas === undefined) {
+      return m('p', {
+        style: {
+          fontSize: '12px',
+          opacity: '0.8',
+        },
+      }, 'No memory delta data.');
+    }
+
+    return this.renderHoverTable(
+      [
+        {title: 'Metric', width: '45%'},
+        {title: 'Delta', width: '55%'},
+      ],
+      [
+        [
+          'Physical Memory',
+          this.formatDeltaBytes(deltas.physicalMemorySizeBytes),
+        ],
+        [
+          'Total Engine Memory',
+          this.formatDeltaBytes(this.getModeSize(
+            deltas.totalEngineSizeBytes,
+            deltas.totalEngineRssSizeBytes,
+          )),
+        ],
+        [
+          'Total BTS Memory',
+          this.formatDeltaBytes(this.getModeSize(
+            deltas.totalBtsEngineSizeBytes,
+            deltas.totalBtsEngineRssSizeBytes,
+          )),
+        ],
+        [
+          'Total MTS Memory',
+          this.formatDeltaBytes(this.getModeSize(
+            deltas.totalMtsEngineSizeBytes,
+            deltas.totalMtsEngineRssSizeBytes,
+          )),
+        ],
+      ],
+    );
+  }
+
+  private renderAliveInstanceCounts(summary: AliveMemorySummary): m.Children {
+    const componentCategories = [
+      'text',
+      'image',
+      'scroll-view',
+      'x-input',
+      'view',
+    ];
+
+    return this.renderHoverTable(
+      [
+        {title: 'Category', width: '35%'},
+        {title: 'Count', width: '65%'},
+      ],
+      [
+        ...componentCategories.map((category) => [
+          category,
+          summary.componentCounts[category] ?? 0,
+        ]),
+        ['lynxTasmElement', summary.elementCount],
+      ],
+    );
+  }
+
+  private renderAliveMemorySummary(
+    summary?: AliveMemorySummary,
+    deltas?: PssMemoryDeltas,
+  ): m.Children {
+    if (summary === undefined) {
+      return null;
+    }
+
+    const btsEngines =
+      Object.values(summary.backgroundThreadScriptingEngines);
+    const btsTotalSizeBytes = btsEngines.reduce(
+      (total, engineInfo) => total + this.getModeSize(
+        engineInfo.sizeBytes,
+        engineInfo.rssSizeBytes,
+      ),
+      0,
+    );
+    const mtsTotalSizeBytes = summary.mainThreadScriptingEngines.reduce(
+      (total, engineInfo) => total + this.getModeSize(
+        engineInfo.sizeBytes,
+        engineInfo.rssSizeBytes,
+      ),
+      0,
+    );
+    const totalEngineSizeBytes = this.getModeSize(
+      summary.totalEngineSizeBytes,
+      summary.totalEngineRssSizeBytes,
+    );
+    const btsVmPoolSizeBytes = this.getModeSize(
+      summary.btsVmPoolSizeBytes,
+      summary.btsVmPoolRssSizeBytes,
+    );
+    const mtsVmPoolSizeBytes = this.getModeSize(
+      summary.mtsVmPoolSizeBytes,
+      summary.mtsVmPoolRssSizeBytes,
+    );
+    const totalVmPoolSizeBytes = this.getModeSize(
+      summary.totalVmPoolSizeBytes,
+      summary.totalVmPoolRssSizeBytes,
+    );
+
+    return m('.alive-memory-summary', {
+      style: {
+        marginBottom: '16px',
+      },
+    }, [
+      m('div', {
+        style: {
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          gap: '16px',
+          marginBottom: '16px',
+        },
+      }, [
+        m('div', [
+          m('h4', {style: {margin: '0 0 8px 0'}}, 'Memory Change Since Trace Start'),
+          this.renderMemoryDeltas(deltas),
+        ]),
+        m('div', [
+          m('h4', {style: {margin: '0 0 8px 0'}}, 'Alive Instance Counts'),
+          this.renderAliveInstanceCounts(summary),
+        ]),
+      ]),
+      m('h4', {style: {margin: '0 0 8px 0'}}, 'Total Engine Memory'),
+      m('div', {
+        style: {
+          marginBottom: '16px',
+          fontSize: '12px',
+          opacity: '0.8',
+        },
+      }, this.renderActiveAndPoolSize(
+        totalEngineSizeBytes,
+        totalVmPoolSizeBytes,
+      )),
+      m('h4', {style: {margin: '0 0 8px 0'}}, 'Background Thread Scripting Engines'),
+      m('div', {
+        style: {
+          marginBottom: '8px',
+          fontSize: '12px',
+          opacity: '0.8',
+        },
+      }, [
+        'Total BTS size: ',
+        this.renderActiveAndPoolSize(btsTotalSizeBytes, btsVmPoolSizeBytes),
+      ]),
+      this.renderBackgroundThreadScriptingEngines(btsEngines, deltas),
+      m('h4', {style: {margin: '0 0 8px 0'}}, 'Main Thread Scripting Engines'),
+      m('div', {
+        style: {
+          marginBottom: '8px',
+          fontSize: '12px',
+          opacity: '0.8',
+        },
+      }, [
+        'Total MTS size: ',
+        this.renderActiveAndPoolSize(mtsTotalSizeBytes, mtsVmPoolSizeBytes),
+      ]),
+      this.renderHoverTable(
+        [
+          {title: 'Instance ID', width: '25%'},
+          {title: 'Description', width: '35%'},
+          {title: 'Size', width: '40%'},
+        ],
+        summary.mainThreadScriptingEngines.map((engineInfo) => [
+          engineInfo.instanceId,
+          engineInfo.desc,
+          this.formatBytes(this.getModeSize(
+            engineInfo.sizeBytes,
+            engineInfo.rssSizeBytes,
+          )),
+        ]),
+      ),
+    ]);
+  }
+
+  view(vnode: m.Vnode<MemoryPssTotalPanelAttrs>): m.Children {
+    const aliveMemorySummary = this.getAliveMemorySummary(vnode.attrs.data);
+    const pssMemoryDeltas = this.getPssMemoryDeltas(vnode.attrs.data);
+
+    if (aliveMemorySummary === undefined) {
+      return m('p', 'No alive memory instances found.');
+    }
+
+    return this.renderAliveMemorySummary(aliveMemorySummary, pssMemoryDeltas);
+  }
+}
+
+export {
+  MemoryDashboard,
+  MemoryPssTotalPanel,
+  MemoryPssTotalModeSelector,
+  SectionWithRightContent,
+};
